@@ -53,16 +53,7 @@ class Question:
 
 
 class DictationCanvas(NumberedCanvas):
-    """Page number plus a restrained, formal authorship mark."""
-
-    def _draw_page_number(self, total_pages: int) -> None:
-        super()._draw_page_number(total_pages)
-        self.saveState()
-        width, _ = A4
-        self.setFillColor(colors.HexColor("#777777"))
-        self.setFont("STKaiti", 8.5)
-        self.drawRightString(width - 12 * mm, 8.5 * mm, "编制：LaoShui")
-        self.restoreState()
+    """Use the shared footer: signature left, page number right."""
 
 
 def normalize_text(text: str) -> str:
@@ -390,7 +381,7 @@ def build_pdf(
         bottomMargin=17 * mm,
         title=title,
         author="LaoShui",
-        subject="IAI English 3100词默写版",
+        subject="高中英语3100词默写版",
         creator="LaoShui",
     )
     document._dictation_header = header
@@ -457,8 +448,12 @@ def make_outputs(input_pdf: Path, output_dir: Path, seed: str) -> list[Path]:
     shuffled_entries = list(entries)
     random.Random(seed).shuffle(shuffled_entries)
 
-    corrected = "校正版" in input_pdf.name
-    edition = "2025校正版" if corrected else "2025版"
+    if "2026版" in input_pdf.name:
+        edition = "2026版"
+    elif "2025差异版" in input_pdf.name or "校正版" in input_pdf.name:
+        edition = "2025差异版"
+    else:
+        edition = "2025版"
     stem = f"高中英语3100词默写版（{edition}）"
     variants = [
         ("混合", "mixed", True),
@@ -511,7 +506,7 @@ def main() -> None:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument(
         "--seed",
-        default="LaoShui-IAI-English-3100-dictation-2026-07-20",
+        default="LaoShui-gaokao-3100-wordlist-dictation-2026-07-20",
         help="Deterministic shuffle seed.",
     )
     args = parser.parse_args()

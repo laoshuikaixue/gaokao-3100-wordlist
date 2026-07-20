@@ -39,6 +39,11 @@ from reportlab.platypus import (
 
 BODY_TOP = 60.0
 BODY_BOTTOM = 765.0
+PAGE_SIDE_MARGIN = 18.5 * mm
+# A ReportLab frame adds 6 pt padding on each side. Keep a further 13 pt
+# tolerance because the wrapper may retain one full-width punctuation mark
+# on the preceding line after that line reaches its nominal width.
+ENTRY_WRAP_WIDTH = A4[0] - 2 * PAGE_SIDE_MARGIN - 12.0 - 13.0
 
 FONT_CJK = Path(r"C:\Windows\Fonts\STKAITI.TTF")
 FONT_TITLE = Path(r"C:\Windows\Fonts\STSONG.TTF")
@@ -98,13 +103,13 @@ class NumberedCanvas(canvas_module.Canvas):
     def _draw_page_number(self, total_pages: int) -> None:
         self.saveState()
         width, _ = A4
+        self.setStrokeColor(colors.HexColor("#D8D8D8"))
+        self.setLineWidth(0.4)
+        self.line(18 * mm, 14 * mm, width - 18 * mm, 14 * mm)
         self.setFillColor(colors.HexColor("#666666"))
         self.setFont("STKaiti", 8.5)
-        self.drawCentredString(
-            width / 2,
-            8.5 * mm,
-            f"第 {self._pageNumber} 页 共 {total_pages} 页",
-        )
+        self.drawString(18 * mm, 8.5 * mm, "编制：LaoShui")
+        self.drawRightString(width - 18 * mm, 8.5 * mm, f"第 {self._pageNumber} 页（共 {total_pages} 页）")
         self.restoreState()
 
 
@@ -157,10 +162,13 @@ def is_entry_start(text: str) -> bool:
         return True
 
     # "a. m." is a real headword, not a derivative label.
-    if text.startswith("a. m./"):
+    if text.startswith(("a. m./", "a.m./")):
         return True
 
-    if "/" not in text:
+    # A normal entry contains a complete /phonetic/ pair.  A continuation
+    # such as ``dreamed/dreamt)vt. ...`` has only one slash and must stay
+    # attached to the preceding ``dream`` entry.
+    if text.count("/") < 2:
         return False
     if DERIVATIVE_PREFIX.match(text):
         return False
@@ -227,6 +235,127 @@ def markup_text(text: str, cjk_font: fitz.Font, latin_font: fitz.Font) -> str:
     return "".join(output)
 
 
+NO_LINE_START_PUNCTUATION = set("，。；：、！？）》】」』”’％%,.;:!?/)…")
+PREFERRED_BREAK_AFTER = set("，。；：、！？,;: ")
+
+
+def merge_entry_rows(rows: tuple[str, ...]) -> str:
+    text = " ".join(row.strip() for row in rows if row.strip()).replace("\u00ad", "-")
+    text = re.sub(r"\s+([，。；：、！？）》】」』”’％%,.;:!?/)])", r"\1", text)
+    text = re.sub(r"([，。；：、！？])\s+", r"\1", text)
+    text = re.sub(r"([（(《【「『“‘])\s*", r"\1", text)
+    text = re.sub(
+        r"(?<=[\u4e00-\u9fff）])\s+(?=[\u4e00-\u9fff（])",
+        "",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def text_width(text: str, font_size: float, cjk_font: fitz.Font, latin_font: fitz.Font) -> float:
+    width = 0.0
+    for char in text:
+        codepoint = ord(char)
+        use_latin = (
+            codepoint < 0x0250 or 0x0250 <= codepoint <= 0x02FF
+        ) and latin_font.has_glyph(codepoint)
+        if not cjk_font.has_glyph(codepoint) and latin_font.has_glyph(codepoint):
+            use_latin = True
+        width += pdfmetrics.stringWidth(
+            char, "TimesNewRoman" if use_latin else "STKaiti", font_size
+        )
+    return width
+
+
+def wrap_entry_text(
+    text: str,
+    max_width: float,
+    font_size: float,
+    cjk_font: fitz.Font,
+    latin_font: fitz.Font,
+) -> list[str]:
+    lines: list[str] = []
+    current: list[str] = []
+    current_width = 0.0
+    for char in text:
+        char_width = text_width(char, font_size, cjk_font, latin_font)
+        if current and current_width + char_width > max_width:
+            if char in NO_LINE_START_PUNCTUATION:
+                current.append(char)
+                lines.append("".join(current))
+                current = []
+                current_width = 0.0
+                continue
+            break_at = next(
+                (
+                    index
+                    for index in range(len(current) - 1, max(-1, len(current) - 17), -1)
+                    if current[index] in PREFERRED_BREAK_AFTER
+                ),
+                None,
+            )
+            if break_at is not None and break_at < len(current) - 1:
+                lines.append("".join(current[: break_at + 1]))
+                current = current[break_at + 1 :] + [char]
+                current_width = text_width(
+                    "".join(current), font_size, cjk_font, latin_font
+                )
+                continue
+            lines.append("".join(current))
+            current = [char]
+            current_width = char_width
+        else:
+            current.append(char)
+            current_width += char_width
+    if current:
+        lines.append("".join(current))
+
+    index = 1
+    while index < len(lines):
+        leading = ""
+        while lines[index] and lines[index][0] in NO_LINE_START_PUNCTUATION:
+            leading += lines[index][0]
+            lines[index] = lines[index][1:]
+        if leading:
+            lines[index - 1] += leading
+        if not lines[index]:
+            del lines[index]
+        else:
+            index += 1
+    return lines or [""]
+
+
+def markup_text_keep_punctuation(
+    text: str, cjk_font: fitz.Font, latin_font: fitz.Font
+) -> str:
+    output: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        if text[index] not in NO_LINE_START_PUNCTUATION or index <= start:
+            index += 1
+            continue
+        punctuation_end = index + 1
+        while (
+            punctuation_end < len(text)
+            and text[punctuation_end] in NO_LINE_START_PUNCTUATION
+        ):
+            punctuation_end += 1
+        protected_start = index - 1
+        if protected_start > start:
+            output.append(markup_text(text[start:protected_start], cjk_font, latin_font))
+        output.append(
+            "<nobr>"
+            + markup_text(text[protected_start:punctuation_end], cjk_font, latin_font)
+            + "</nobr>"
+        )
+        start = punctuation_end
+        index = punctuation_end
+    if start < len(text):
+        output.append(markup_text(text[start:], cjk_font, latin_font))
+    return "".join(output)
+
+
 def footer(canvas, document) -> None:
     canvas.saveState()
     width, _ = A4
@@ -236,9 +365,7 @@ def footer(canvas, document) -> None:
     canvas.restoreState()
 
 
-def build_pdf(
-    entries: list[Entry], output_path: Path, seed: str, corrected: bool
-) -> list[Entry]:
+def build_pdf(entries: list[Entry], output_path: Path, seed: str, edition: str) -> list[Entry]:
     cjk_font, latin_font = register_fonts()
     shuffled = list(entries)
     random.Random(seed).shuffle(shuffled)
@@ -246,18 +373,14 @@ def build_pdf(
     document = SimpleDocTemplate(
         str(output_path),
         pagesize=A4,
-        leftMargin=19 * mm,
-        rightMargin=19 * mm,
-        topMargin=17 * mm,
-        bottomMargin=20 * mm,
-        title=(
-            "高中英语《新课程标准》3100词总表（2025校正版）乱序版"
-            if corrected
-            else "高中英语《新课程标准》3100词总表（2025版）乱序版"
-        ),
-        author="LaoShui",
-        subject="单词原始来源：IAI English",
-        creator="LaoShui",
+        leftMargin=PAGE_SIDE_MARGIN,
+        rightMargin=PAGE_SIDE_MARGIN,
+        topMargin=22 * mm,
+        bottomMargin=25 * mm,
+        title=f"高中英语《新课程标准》3100词总表 · {edition} · 乱序版",
+        author="编制：LaoShui",
+        subject=f"普通高中英语课程标准3100词表 · {edition}",
+        creator="编制：LaoShui",
     )
 
     styles = getSampleStyleSheet()
@@ -303,6 +426,7 @@ def build_pdf(
         spaceAfter=2.6,
         allowWidows=0,
         allowOrphans=0,
+        wordWrap=None,
     )
     final_title_style = ParagraphStyle(
         "FinalTitle",
@@ -319,69 +443,44 @@ def build_pdf(
         textColor=colors.HexColor("#222222"),
     )
 
-    intro_lines = [
-        "【编写说明】",
-        (
-            "本词汇表共3100词，按字母顺序，依次分类包括："
-            if corrected
-            else "本词汇表共3000词，按字母顺序，依次分类包括："
-        ),
-        "(1) 初中英语义务教育阶段要求掌握的1600个单词；",
-        "(2) 高中英语必修课程应学习和掌握500个单词（词尾加有一个*号）；",
-        (
-            "(3) 高中英语选择性必修课程应学习和掌握1000个单词（词尾加有两个*号）。"
-            if corrected
-            else "(3) 高中英语选择性必修课程应学习和掌握l000个单词（词尾加有两个*号）。"
-        ),
-    ]
-    if corrected:
-        intro_lines.append(
-            "(4) 本版系在2025版基础上由LaoShui校正，限于学识，错漏之处在所难免，尚祈读者不吝指正。"
-        )
-    intro_lines.extend(
-        [
-            "注：本表出现的单词要求全部背诵，并要求掌握其派生词！",
-            "如：sight-sighted；space-spacious",
-            "新高考命题以新课标为准！",
-        ]
-    )
-    intro_markup_lines: list[str] = []
-    for line in intro_lines:
-        marked_up = markup_text(line, cjk_font, latin_font)
-        if corrected and line.startswith("(4) "):
-            # This line fits at 11 pt but narrowly wraps at the default 11.2 pt.
-            marked_up = f'<font size="11">{marked_up}</font>'
-            marked_up += "<br/>"
-        intro_markup_lines.append(marked_up)
-    intro_markup = "<br/>".join(intro_markup_lines)
-
     story = [
         Spacer(1, 15 * mm),
         Paragraph("高中英语《新课程标准》3100词总表", title_style),
-        Paragraph("2025校正版 · 乱序版" if corrected else "2025版 · 乱序版", subtitle_style),
-        Spacer(1, 13 * mm),
-        Paragraph(intro_markup, note_style),
+        Paragraph(f"{edition} · 乱序版", subtitle_style),
+        Spacer(1, 8 * mm),
+        Paragraph("【编写说明】", note_style),
+        Paragraph(
+            "本词表以《普通高中英语课程标准（2017年版2025年修订）》附录2为词头与星级依据，并结合多方资料补充音标、高考高频释义、必要熟词生义及常用派生/搭配。",
+            note_style,
+        ),
+        Paragraph("(1) 无星号：义务教育阶段要求掌握的词汇。", note_style),
+        Paragraph("(2) *：高中英语必修课程应学习和掌握的词汇。", note_style),
+        Paragraph("(3) **：高中英语选择性必修课程应学习和掌握的词汇。", note_style),
+        Paragraph(
+            '(4) 本词表由 LaoShui 依据多方资料整理编制而成。虽经反复校核，然限于学识，错漏之处在所难免，敬请读者不吝赐教。如蒙指正，烦请访问 '
+            '<font name="TimesNewRoman"><link href="https://github.com/laoshuikaixue/gaokao-3100-wordlist" color="#245A9A">https://github.com/laoshuikaixue/gaokao-3100-wordlist</link></font>，'
+            '提交 Issue 或 Pull Request，以便及时修订完善。谨此致谢。',
+            note_style,
+        ),
+        Spacer(1, 3 * mm),
+        Paragraph(
+            "注：音标以英式读音为主，必要时标注英美差异；正文为乱序版。",
+            note_style,
+        ),
         PageBreak(),
     ]
 
     for entry in shuffled:
-        lines = [markup_text(line, cjk_font, latin_font) for line in entry.rows]
-        paragraph = Paragraph("<br/>".join(lines), entry_style)
-        story.append(KeepTogether([paragraph]))
-
-    story.extend(
-        [
-            PageBreak(),
-            Spacer(1, 58 * mm),
-            Paragraph("编制说明", final_title_style),
-            Paragraph('<font name="TimesNewRoman-Bold">Powered By LaoShui</font>', final_style),
-            Spacer(1, 5 * mm),
-            Paragraph(
-                markup_text("单词原始来源：IAI English", cjk_font, latin_font),
-                final_style,
+        text = merge_entry_rows(entry.rows)
+        lines = wrap_entry_text(text, ENTRY_WRAP_WIDTH, 10.8, cjk_font, latin_font)
+        paragraph = Paragraph(
+            "<br/>".join(
+                markup_text_keep_punctuation(line, cjk_font, latin_font)
+                for line in lines
             ),
-        ]
-    )
+            entry_style,
+        )
+        story.append(KeepTogether([paragraph]))
 
     document.build(
         story,
@@ -401,12 +500,12 @@ def digest_entries(entries: list[Entry]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create a shuffled IAI English word-list PDF.")
+    parser = argparse.ArgumentParser(description="Create a shuffled Gaokao 3100 word-list PDF.")
     parser.add_argument("input_pdf", type=Path)
     parser.add_argument("output_pdf", type=Path)
     parser.add_argument(
         "--seed",
-        default="LaoShui-IAI-English-3100-2026-07-15",
+        default="LaoShui-gaokao-3100-wordlist-2026-07-20",
         help="Deterministic shuffle seed.",
     )
     args = parser.parse_args()
@@ -417,8 +516,15 @@ def main() -> None:
         raise RuntimeError(f"Only {len(entries)} entries were detected; extraction is incomplete.")
 
     before = digest_entries(entries)
-    corrected = "校正版" in args.input_pdf.name
-    shuffled = build_pdf(entries, args.output_pdf, args.seed, corrected)
+    if "2026版" in args.input_pdf.name:
+        edition = "2026版"
+    elif "2025差异版" in args.input_pdf.name:
+        edition = "2025差异版"
+    elif "校正版" in args.input_pdf.name:
+        edition = "2025差异版"
+    else:
+        edition = "2025版"
+    shuffled = build_pdf(entries, args.output_pdf, args.seed, edition)
     after = digest_entries(shuffled)
     if before != after:
         raise RuntimeError("Entry content changed during shuffling.")
@@ -428,7 +534,7 @@ def main() -> None:
     print(f"Visual rows: {sum(len(entry.rows) for entry in entries)}")
     print(f"Content SHA-256: {before}")
     print(f"Unchanged positions after shuffle: {unchanged_positions}")
-    print(f"Edition: {'2025校正版' if corrected else '2025版'}")
+    print(f"Edition: {edition}")
     print(f"Output: {args.output_pdf.resolve()}")
 
 
